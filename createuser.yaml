@@ -1,0 +1,241 @@
+---
+- name: Check if hostname is in /etc/hosts
+  lineinfile:
+    path: "/etc/hosts"
+    regexp: "^\\s*\\d+.*\\b{{ ansible_fqdn }}\\b"
+    state: absent
+  check_mode: true
+  changed_when: false
+  register: hosts
+
+- name: Add hostname to /etc/hosts
+  lineinfile:
+    path: "/etc/hosts"
+    regex: "^\\s*{{ ansible_default_ipv4.address|default(ansible_all_ipv4_addresses[0]) }}\\s"
+    line: "{{ ansible_default_ipv4.address|default(ansible_all_ipv4_addresses[0]) }} {{ ansible_fqdn }} {{ ansible_hostname }}"
+    insertbefore: '\b127\.0\.0\.1\b'
+    firstmatch: true
+  when: not hosts.found
+
+- name: Check if user exists
+  shell: id -u {{ ac_user }}
+  register: user_check
+  ignore_ignore_errors: true
+  changed_when: true
+
+- name: Add user {{ ac_user }}
+  user:
+    name: "{{ ac_user }}"
+    comment: "Alveo Prime (AC) user"
+    shell: /bin/bash
+    group: "{{ ac_group|default(omit) }}"
+    home: "{{ ac_home_dir|default(omit) }}"
+  register: user_created
+  when: user_check.failed
+
+- name: Create sudoers file
+  template:
+    src: asscon_sudoers.j2
+    dest: "/etc/sudoers.d/{{ ac_user }}"
+    owner: root
+    group: root
+    mode: '0440'
+  become: true
+  become_user: root
+  when: user_created is succeeded
+- name: Check if .ssh directory exists
+    stat:
+      path: "/{{ ac_home_dir }}/.ssh"
+      register: ssh_directory_check
+      
+- name: Create .ssh folder
+  file:
+    path: "{{ ac_home_dir }}/.ssh"
+    state: directory
+    owner: "{{ ac_user }}"
+    group: "{{ ac_user_group|default(omit) }}"
+    mode: "0755"
+  when:
+    - Check if .ssh directory exists
+    - user_created is succeeded
+
+- name: Generate SSH key pair for asscon user
+  shell: ssh-keygen -t rsa -b 2048 -f {{ ac_home_dir }}/.ssh/{{ ac_user }}-{{ ansible_hostname }}.pem -N ""
+  become: yes
+  become_user: "{{ ac_user }}"
+  register: user_sshkey
+  when: user_created is succeeded
+
+- name: Add to authorized keys
+  shell: cat {{ ac_home_dir }}/.ssh/{{ ac_user }}-{{ ansible_hostname }}.pem.pub >> {{ ac_home_dir }}/.ssh/authorized_keys
+  become: yes
+  become_user: "{{ ac_user }}"
+  when: user_sshkey is succeeded
+
+- name: Add LD_LIBRARY to PATH
+  shell:
+    cmd: "echo 'export LD_LIBRARY_PATH=/usr/lib/oracle/12.2/client64/lib:$LD_LIBRARY_PATH' >> {{ ac_home_dir }}/.bash_profile && echo 'export PATH=/usr/lib/oracle/12.2/client64/bin:$PATH' >> {{ ac_home_dir }}/.bash_profile"
+    warn: false
+  become: true
+  become_user: "{{ ac_user }}"
+
+- name: Create symbolic link /app pointing to /u01/app only for ZTS
+  file:
+    src: /u01/app
+    dest: /app
+    state: link
+
+- name: Creating /app/asscon directory
+  file:
+    path: /app/asscon
+    state: directory
+
+- name: Change owner of /app to asscon:asscon
+  file:
+    path: /app
+    owner: asscon
+    group: asscon
+
+- name: Change owner of /u01/app to asscon:asscon
+  file:
+    path: /u01/app
+    owner: asscon
+    group: asscon
+    state: directory
+    recurse: yes
+
+- name: Setup package directory structure
+  shell:
+    cmd: "mkdir -p {{ ac_project_dir }}/{etc,downloads,pkg,log}"
+    chdir: "{{ zts_home_dir }}"
+    warn: false
+  become: true
+  become_user: "{{ ac_user }}"
+  changed_when: false
+
+- name: Create ac.config
+  template:
+    src: ac.config.j2
+    dest: "{{ zts_home_dir }}/{{ ac_project_dir }}/etc/ac.config"
+    mode: 0644
+  become: true
+  become_user: "{{ ac_user }}"
+
+- name: Copy license
+  copy:
+    src: "{{ item }}"
+    dest: "{{ zts_home_dir }}/{{ ac_project_dir }}/etc/"
+    force: false
+  become: true
+  become_user: "{{ ac_user }}"
+  loop:
+    - license.txt
+
+- name: Create Prime directories
+  shell:
+    cmd: |
+      . {{ zts_home_dir }}/{{ ac_project_dir }}/etc/ac.config
+      mkdir -p "$CONFIG_AC_SYSTEM" "$CONFIG_AC_DATA" "$CONFIG_AC_WORKDIR" "$CONFIG_AC_LOGDIR" "$CONFIG_AC_DOCKERDIR" "$CONFIG_AC_MSUSERDIR"
+      chown "{{ ac_user }}:$(id -ng {{ ac_user }})" "$CONFIG_AC_SYSTEM" "$CONFIG_AC_DATA" "$CONFIG_AC_WORKDIR" "$CONFIG_AC_LOGDIR" "$CONFIG_AC_DOCKERDIR" "$CONFIG_AC_MSUSERDIR"
+      ln -s "$CONFIG_AC_SYSTEM" ~{{ ac_user }}/ac
+      ln -s "$CONFIG_AC_DATA" ~{{ ac_user }}/data
+      ln -s "$CONFIG_AC_WORKDIR" ~{{ ac_user }}/workdir
+      ln -s "$CONFIG_AC_LOGDIR" ~{{ ac_user }}/log
+      ln -s "$CONFIG_AC_DOCKERDIR" ~{{ ac_user }}/docker
+      ln -s "$CONFIG_AC_MSUSERDIR" ~{{ ac_user }}/msusers
+      ln -s "$CONFIG_AC_PKGDIR" ~{{ ac_user }}/pkg
+      chown -h "{{ ac_user }}:$(id -ng {{ ac_user }})" ~{{ ac_user }}/ac ~{{ ac_user }}/data ~{{ ac_user }}/workdir ~{{ ac_user }}/log ~{{ ac_user }}/docker ~{{ ac_user }}/msusers ~{{ ac_user }}/pkg
+    warn: false
+  become: true
+
+# - name: Create Ven directories
+#   shell:
+#     cmd: |
+#       . ~{{ ac_user }}/{{ ac_project_dir }}/etc/ac.config
+#       mkdir -p $CONFIG_VEN_INDIR_01 $CONFIG_VEN_INDIR_02 $CONFIG_VEN_INDIR_03 $CONFIG_VEN_OUTDIR_01 $CONFIG_VEN_OUTDIR_02 $CONFIG_VEN_VENDORDIR_01 $CONFIG_VEN_VENDORDIR_02 $CONFIG_VEN_VENDORDIR_03 $CONFIG_VEN_VENDORDIR_04 $CONFIG_VEN_VENDORDIR_05 $CONFIG_VEN_VENDORDIR_06 $CONFIG_VEN_VENDORDIR_07 $CONFIG_VEN_WORKDIR_01 $CONFIG_VEN_WORKDIR_02 $CONFIG_VEN_WORKDIR_03 $CONFIG_VEN_WORKDIR_04
+#       chown "{{ ac_user }}:$(id -ng {{ ac_user }})" $CONFIG_VEN_INDIR_01 $CONFIG_VEN_INDIR_02 $CONFIG_VEN_INDIR_03 $CONFIG_VEN_OUTDIR_01 $CONFIG_VEN_OUTDIR_02 $CONFIG_VEN_VENDORDIR_01 $CONFIG_VEN_VENDORDIR_02 $CONFIG_VEN_VENDORDIR_03 $CONFIG_VEN_VENDORDIR_04 $CONFIG_VEN_VENDORDIR_05 $CONFIG_VEN_VENDORDIR_06 $CONFIG_VEN_VENDORDIR_07 $CONFIG_VEN_WORKDIR_01 $CONFIG_VEN_WORKDIR_02 $CONFIG_VEN_WORKDIR_03 $CONFIG_VEN_WORKDIR_04
+#     warn: false
+#   become: true
+
+#  #- name: Download ac-pkg from repository
+#  #  maven_artifact:
+#  #    repository_url: "{{ ac_nexus_repo|default(omit) }}/ac-artifacts"
+#  #    group_id: "ac-pkg"
+#  #    artifact_id: "{{ item }}"
+#  #    version: "{{ ac_pkg_version|default(omit) }}"
+#  #    classifier: "pkg"
+#  #    extension: "tar.gz"
+#  #    dest: "$HOME/{{ ac_project_dir }}/pkg"
+#  #  loop: "{{ ac_pkg_list }}"
+#  #  become: true
+#  #  become_user: "{{ ac_user }}"
+#  #  when: (ac_pkg_list is defined) and (ac_pkg_list | length > 0)
+#  #
+#  #- name: Download asset-control from repository
+#  #  maven_artifact:
+#  #    repository_url: "{{ ac_nexus_repo|default(omit) }}/{{ item.r|default('releases') }}"
+#  #    group_id: "{{ item.g|default('asset-control') }}"
+#  #    artifact_id: "{{ item.a }}"
+#  #    version: "{{ item.v|default(omit) }}"
+#  #    classifier: "{{ item.c|default(omit) }}"
+#  #    extension: "{{ item.e|default('tar.gz') }}"
+#  #    keep_name: true
+#  #    dest: "$HOME/{{ ac_project_dir }}/downloads"
+#  #  loop: "{{ asset_control_artifacts }}"
+#  #  become: true
+#  #  become_user: "{{ ac_user }}"
+#  #  when: (asset_control_artifacts is defined) and (asset_control_artifacts | length > 0)
+
+- name: Copy AC-PKG artifacts
+  copy:
+    src: "{{ item }}"
+    dest: "{{ zts_home_dir }}/{{ ac_project_dir }}/pkg/"
+    force: false
+  become: true
+  become_user: "{{ ac_user }}"
+  loop:
+    - ac-installer-2.1.0-SNAPSHOT-pkg.tar.gz
+    - ac-server-2.1.0-SNAPSHOT-pkg.tar.gz
+    - ac-interface-2.1.0-SNAPSHOT-pkg.tar.gz
+    - ac-ieclv2-2.1.0-SNAPSHOT-pkg.tar.gz
+    - ac-application-data-A0-2.1.0-SNAPSHOT-pkg.tar.gz
+    - ac-iedk-2.1.0-SNAPSHOT-pkg.tar.gz
+
+- name: Copy AC OOB artifacts
+  copy:
+    src: "{{ item }}"
+    dest: "{{ zts_home_dir }}/{{ ac_project_dir }}/downloads/"
+    force: false
+  become: true
+  become_user: "{{ ac_user }}"
+  loop:
+    - ie-utils-1.0.2-pkg.tar.gz
+    - ie-development-kit-2.1.18-pkg.tar.gz
+    - ie-framework-3.3.113-pkg.tar.gz
+    - iecl-basic-2.1.22-pkg.tar.gz
+    - application-data_a0-1.0.8-pkg.tar.gz    
+    - ac-server-7.3.55-rhel8_x86_64.tar.gz
+    - workflow-engine-1.7.3-pkg.tar.gz
+    - bloomberg-normalization-3.1.140-pkg.tar.gz
+
+- name: Unpack ac-installer
+  shell:
+    cmd: |
+      fn="$(ls -1rtd ac-installer*-pkg.tar.gz 2>/dev/null | tail -1)"
+      [ -z "$fn" ] || tar -zxf "$fn"
+    chdir: "{{ zts_home_dir }}/{{ ac_project_dir }}/pkg"
+    creates: "{{ zts_home_dir }}/{{ ac_project_dir }}/pkg/install_all.sh"
+    warn: false
+  become: true
+  become_user: "{{ ac_user }}"
+  #changed_when: false
+  
+- name: Install all
+  shell:
+    #cmd: "[ -s '../etc/{{ ac_user }}' -o -z '{{ ac_password|default('') }}' ] || export AC_RDBMS_PW='{{ ac_password|default('') }}'; ./install_all.sh; true"
+    cmd: "[ -s '../etc/{{ ac_user }}' -o -z '{{ ac_password|default('') }}' ] || export AC_RDBMS_PW='{{ ac_password|default('') }}'; export ORACLE_HOME=/usr/lib/oracle/12.2/client64; export TNS_ADMIN=$ORACLE_HOME/network/admin; ./install_all.sh; true"
+    chdir: "{{ zts_home_dir }}/{{ ac_project_dir }}/pkg"
+    warn: false
+  become: true
+  become_user: "{{ ac_user }}"
+
