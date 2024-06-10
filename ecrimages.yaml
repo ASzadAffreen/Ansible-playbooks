@@ -1,0 +1,134 @@
+---
+- name: Install and configure AWS CLI
+  hosts: all
+  become: yes
+  vars:
+    aws_access_key: "accesskey"
+    aws_secret_key: "secretkey"
+    aws_region: "us-east-1"
+    aws_default_output: "table"
+    ecr_registry_id: "590183938876.dkr.ecr.us-east-1.amazonaws.com/ansibletestimages"  # Change this to your ECR URL
+    aws_profile: "default"
+    ecr_repository_name: "ansibletestimages"
+
+  tasks:
+    - name: Update apt package index
+      apt:
+        update_cache: yes
+
+    - name: Install packages
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - curl
+        - unzip
+    
+    - name: Check Docker version
+      command: docker --version
+      register: docker_version_output
+      ignore_errors: yes
+    
+    - name: Install prerequisites'
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - software-properties-common
+        state: present
+      when: docker_version_output.failed
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      when: docker_version_output.failed
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+      when: docker_version_output.failed
+
+    - name: Update apt package index after adding Docker repo
+      apt:
+        update_cache: yes
+      when: docker_version_output.failed
+  
+    - name: Install Docker
+      apt:
+        name: docker-ce
+        state: present
+      when: docker_version_output.failed
+
+    - name: Start Docker service
+      service:
+        name: docker
+        state: started
+        enabled: yes
+      when: docker_version_output.failed
+    
+    - name: Check if AWS CLI is installed
+      command: aws --version
+      register: aws_cli_check
+      ignore_errors: yes
+      when: docker_version_output.failed
+    
+    - name: Download AWS CLI
+      command: "curl 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' -o '/tmp/awscliv2.zip'"
+      when: aws_cli_check.failed
+    
+    - name: Unzip AWS CLI package
+      unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp
+        remote_src: yes
+      when: aws_cli_check.failed
+
+    - name: Install AWS CLI
+      command: /tmp/aws/install
+      when: aws_cli_check.failed
+
+    - name: Configure AWS access key
+      shell: aws configure set aws_access_key_id {{ aws_access_key }}
+      when: aws_cli_check.failed
+
+    - name: Configure AWS secret key
+      shell: aws configure set aws_secret_access_key {{ aws_secret_key }}
+      when: aws_cli_check.failed
+
+    - name: Configure AWS region
+      shell: aws configure set region {{ aws_region }}
+      when: aws_cli_check.failed
+
+    - name: Retrieve ECR login password
+      shell: aws ecr get-login-password --region {{ aws_region }}
+      register: ecr_login_password
+      when: docker_version_output is succeeded
+    
+    - name: Login to ECR
+      shell: echo {{ ecr_login_password.stdout }} | docker login --username AWS --password-stdin {{ ecr_registry_id }}.dkr.ecr.{{ aws_region }}.amazonaws.com/{{ ecr_repository_name }}
+      args:
+        executable: /bin/bash
+      when: docker_version_output is succeeded
+    
+    - name: Get list of images in the repository
+      shell:  aws ecr list-images --repository-name {{ ecr_repository_name }} --region {{ aws_region }} --query 'imageIds[*].imageTag' --output text
+      register: ecr_images
+   
+    - name: Display the docker Images Tags
+      debug:
+        var: ecr_images.stdout_lines
+
+    - name: Replace tabs with spaces in image tags
+      set_fact:
+        ecr_image_tags_list: "{{ ecr_images.stdout.split('\t') }}"
+
+    - name: Display ECR image tags
+      debug:
+        var: ecr_image_tags_list
+
+    - name: Pull Docker images from ECR
+      shell: docker pull {{ ecr_registry_id }}:{{ item }}
+      loop: "{{ ecr_image_tags_list }}"
+      ignore_errors: true
